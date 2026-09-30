@@ -1,0 +1,4 @@
+# client documents and credentials stay local
+source_docs/
+.env
+__pycache__/
