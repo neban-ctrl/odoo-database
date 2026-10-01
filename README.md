@@ -25,3 +25,23 @@ Put the four source files in `./source_docs/` (git-ignored) with the names used 
 Notes
 * Creates 8 internal users for the BEST team (use `--no-users` to skip). Logins use the reserved non-deliverable domain `@bcsi-demo.example` and Odoo-inbox notifications, so nobody named in the documents is e-mailed.
 * Schedule dates beyond the document dates (RFI 6/2/26, SEI response 6/10/26, transmittal 6/15/26) are illustrative for the demo Gantt.
+
+## Workflow configuration (`--workflow`)
+
+Run after the base build. Adds what makes the BCSI process flow move in a demo:
+
+1. **Phase gates**: tasks tagged *Phase Gate* (Execute Contract, PH1A meeting, field work, archive) advance the project PH1 → PH2 → PH3 → PH4 → Complete when marked done (automation rule).
+2. **Ruskin settings**: timesheets, portal sharing, e-mail alias `ruskin-k1k2@…` (incoming e-mails become tasks), Documents folder.
+3. **Activity types**: RFI Response Due (+7), Notify Client (+5), Submittal Follow-up (+14), Pre-Job Meeting.
+4. **Activity plans**: PH1 Contract Handoff, PH2 Preconstruction, Submittal Package, RFI, PH4 Closeout.
+5. **Project template** "BCSI Job Template": the full PH1–PH4 process without job data.
+6. **Automation rules**: phase gates; new RFI / submittal / incoming doc tasks get their follow-up activity automatically.
+7. **CRM**: bidding pipeline (Bid Invitation → Estimating → 80% → 90% → Proposal → Won), Ruskin opportunity (won), a demo bid.
+8. **Sales**: "BCSI Roofing Contract" product that creates a project from the template, invoiced by milestones.
+9. **Purchase**: Sikaflex-1A, BUR felts, cap sheet, sheet metal products; draft RFQ to Sika linked to Ruskin.
+10. **Employees & Planning**: planning roles, employees for the team, Ruskin shifts (master field resource schedule).
+11. **Documents**: Ruskin folder structure (replaces SharePoint).
+
+```bash
+wget -qO- https://raw.githubusercontent.com/neban-ctrl/odoo-database/<commit>/build_ruskin_project.py | python3 - --workflow
+```

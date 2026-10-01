@@ -700,7 +700,7 @@ class DryRun(Odoo):
     def x(self, model, method, *args, **kw):
         self.calls.append((model, method))
         if method in ("search",):
-            return []
+            return [7] if getattr(self, "found", False) else []
         if method == "search_read":
             return [{"id": 1, "res_id": 1}]
         if method == "create":
@@ -987,14 +987,406 @@ def build(o, create_users=True):
     return project
 
 
+# ---------------------------------------------------------------------------
+# --workflow : configurations that make the BCSI process flow "move" in a demo
+# ---------------------------------------------------------------------------
+TEMPLATE_NAME = "BCSI Job Template (PH1 Contract > PH4 Closeout)"
+
+# Phase-gate tasks: completing one advances the project to the next project stage.
+PHASE_GATES = ["Execute Contract", "Project Execution Plan (PH1A Meeting)",
+               "BCSI Activities - Schedule (Field Work K1 & K2)", "Archive Project Files"]
+
+ACTIVITY_TYPES = [  # name, delay days, default summary, icon
+    ("RFI Response Due", 7, "RFI response due (date sent + 7)", "fa-question-circle"),
+    ("Notify Client (+5)", 5, "Notify client of impacts (date received + 5)", "fa-bell"),
+    ("Submittal Follow-up", 14, "Follow up on submittal review", "fa-files-o"),
+    ("Pre-Job Meeting", 14, "Pre-job meeting ~2 weeks before start", "fa-users"),
+]
+
+# Activity plans (Project > task > "Schedule activities" > plan). (summary, user key, days after plan date, type)
+ACTIVITY_PLANS = {
+    "PH1 - Contract Handoff (Sales > Admin > Legal > Ops)": [
+        ("Provide project overview", "alona", 0, None),
+        ("Create project folder in Documents (replaces SharePoint link)", "kassandra", 0, None),
+        ("Prepare job package & routing form, send link to Ops", "alona", 3, None),
+        ("Review contract", "alona", 5, None),
+        ("Project set up in Vista / Accounting", "kassandra", 7, None),
+        ("Assign operations team (PM / Super / PE)", "maria", 7, None),
+        ("Set up Phase 1 (PH1) meeting", "maria", 10, None),
+        ("Execute contract (Sign)", "alona", 14, None),
+    ],
+    "PH2 - Preconstruction (Ops Team)": [
+        ("Enter project in master field resource schedule (Planning)", "maria", 0, None),
+        ("Create submittal log", "kris", 2, None),
+        ("Project kick-off with Owner / GC / manufacturer / subs", "chris", 5, None),
+        ("Generate SOV", "maria", 7, None),
+        ("Generate procurement schedule", "maria", 10, None),
+        ("Finalize budget (material, labor, equipment)", "maria", 14, None),
+        ("Provide field binder", "kris", 21, None),
+        ("Project execution plan (PH1A meeting)", "maria", 25, "Pre-Job Meeting"),
+    ],
+    "Submittal Package": [
+        ("Prepare transmittal & product data", "kassandra", 0, None),
+        ("Send submittal to GC", "kassandra", 1, None),
+        ("Follow up on review", "kris", 14, "Submittal Follow-up"),
+        ("Release material / PO", "maria", 21, None),
+    ],
+    "RFI": [
+        ("Send RFI to GC", "maria", 0, None),
+        ("RFI response due", "kris", 7, "RFI Response Due"),
+        ("Distribute response to field / update field binder", "chris", 8, None),
+        ("Evaluate cost / schedule impact (PCO)", "maria", 9, "Notify Client (+5)"),
+    ],
+    "PH4 - Closeout": [
+        ("Clean-up POs", "maria", 0, None),
+        ("Punchlist walk with Owner / GC / manufacturer", "chris", 0, None),
+        ("Finalize change orders", "maria", 7, None),
+        ("Closeout log to Admin", "kris", 14, None),
+        ("PH3 meeting - lessons learned", "maria", 21, None),
+        ("Archive project files", "kassandra", 28, None),
+    ],
+}
+
+PHASE_GATE_CODE = """
+for rec in records:
+    proj = rec.project_id
+    if not proj:
+        continue
+    cur = proj.stage_id.sequence if proj.stage_id else 0
+    nxt = env['project.project.stage'].search([('sequence', '>', cur)], order='sequence, id', limit=1)
+    if nxt:
+        proj.write({'stage_id': nxt.id})
+        proj.message_post(body="Phase gate completed: %s - project moved to %s" % (rec.name, nxt.name))
+"""
+
+ACTIVITY_CODE = """
+atype = env['mail.activity.type'].search([('name', '=', %(type)r)], limit=1)
+for rec in records:
+    rec.activity_schedule(activity_type_id=atype.id, summary=%(summary)r,
+                          date_deadline=datetime.date.today() + datetime.timedelta(days=%(days)d),
+                          user_id=(rec.user_ids[:1].id or env.user.id))
+"""
+
+AUTOMATIONS = [  # name, tag, code, pre-domain needed
+    ("BCSI: Phase gate completed -> advance project phase", "Phase Gate", PHASE_GATE_CODE, "state"),
+    ("BCSI: New RFI -> response due in 7 days", "RFI",
+     ACTIVITY_CODE % {"type": "RFI Response Due", "summary": "RFI response due (sent + 7)", "days": 7}, "tag_ids"),
+    ("BCSI: New submittal -> follow up in 14 days", "Submittal",
+     ACTIVITY_CODE % {"type": "Submittal Follow-up", "summary": "Follow up on submittal review", "days": 14}, "tag_ids"),
+    ("BCSI: Incoming document -> notify client within 5 days", "Incoming Doc",
+     ACTIVITY_CODE % {"type": "Notify Client (+5)", "summary": "Notify client of impacts (received + 5)", "days": 5},
+     "tag_ids"),
+]
+
+CRM_STAGES = [("Bid Invitation", False), ("Estimating / Bidding", False), ("80% Report", False),
+              ("90% Report", False), ("Proposal Submitted", False), ("Won - Accepted Proposal", True)]
+
+PLANNING_ROLES = [("Project Manager", 1), ("Project Engineer", 10), ("Superintendent", 5),
+                  ("Field Manager", 6), ("Foreman", 2), ("QC Manager", 7), ("Project Executive", 3),
+                  ("Project Administration", 9)]
+TEAM_ROLES = {"maria": "Project Manager", "kris": "Project Engineer", "raymond": "Project Engineer",
+              "chris": "Superintendent", "joseph": "Foreman", "wes": "QC Manager",
+              "alona": "Project Executive", "kassandra": "Project Administration"}
+
+# Planning shifts on Ruskin (UTC; 15:00 UTC = 8am Pacific)
+SLOTS = [
+    ("kris", "2026-09-28 15:00:00", "2026-10-03 00:00:00", "Submittals & field binder"),
+    ("maria", "2026-09-28 15:00:00", "2026-10-03 00:00:00", "PCO-01 / budget re-adjustment"),
+    ("chris", "2026-10-05 15:00:00", "2026-11-21 01:00:00", "Field work K1 & K2"),
+    ("joseph", "2026-10-05 15:00:00", "2026-11-21 01:00:00", "Field work K1 & K2 (foreman)"),
+    ("wes", "2026-11-19 16:00:00", "2026-11-21 01:00:00", "Representative sampling / QC"),
+]
+
+DOC_FOLDERS = ["01 Contract & Routing Form", "02 Job Package", "03 Submittals", "04 RFIs & Incoming Docs",
+               "05 Field Binder", "06 Change Orders", "07 Closeout"]
+
+PRODUCTS = [  # name, spec, vendor key
+    ("Sikaflex-1A Polyurethane Sealant - 10.1 oz Cartridge", "07 90 05", "sika"),
+    ("BUR Ply Sheet (Felt) - 4-Ply Built-Up System", "07 51 05", None),
+    ("BUR Cap Sheet", "07 51 05", None),
+    ("Sheet Metal Flashing", "07 60 05", None),
+]
+
+
+def configure_workflow(o):
+    log = print
+    log(f"Connected: db={o.db} uid={o.uid} version={o.version.get('server_version')}")
+
+    def safe(label, fn):
+        try:
+            return fn()
+        except Exception as e:
+            log(f"  skipped {label}: {str(e).strip().splitlines()[-1][:160]}")
+
+    def one(model, domain):
+        r = o.x(model, "search", domain, limit=1, context={"active_test": False})
+        return r[0] if r else False
+
+    def model_exists(model):
+        return bool(o.x("ir.model", "search", [("model", "=", model)], limit=1))
+
+    project = one("project.project", [("name", "=", PROJECT_NAME)])
+    if not project:
+        sys.exit("Run the base build first (without --workflow): the Ruskin project was not found.")
+    users = {}
+    for m in TEAM:
+        u = one("res.users", [("login", "=", f"{m['login']}@{LOGIN_DOMAIN}")]) or one("res.users", [("name", "=", m["name"])])
+        if u:
+            users[m["key"]] = u
+    partner = {k: one("res.partner", [("name", "=", n)]) for k, n in
+               (("customer", CUSTOMER["name"]), ("sika", "Sika Corporation"), ("gc", "Strawn Construction"))}
+    tags = {n: o.upsert("project.tags", [("name", "=", n)], {"name": n, "color": c})
+            for n, c in list(TAG_COLORS.items()) + [("Phase Gate", 1)]}
+    log(f"Found Ruskin project id={project}, {len(users)} team users")
+
+    # 1. Phase-gate tags on Ruskin (before automations exist, so nothing fires now)
+    for name in PHASE_GATES:
+        t = one("project.task", [("project_id", "=", project), ("name", "=", name)])
+        if t:
+            safe("phase gate tag", lambda t=t: o.x("project.task", "write", [t], {"tag_ids": [(4, tags["Phase Gate"])]}))
+    log("1. Phase-gate tasks tagged")
+
+    # 2. Project-level settings on Ruskin: timesheets, portal sharing, e-mail alias, documents
+    for k, v in (("allow_timesheets", True), ("privacy_visibility", "portal"), ("alias_name", "ruskin-k1k2"),
+                 ("use_documents", True), ("allow_milestones", True), ("allow_task_dependencies", True)):
+        if o.has("project.project", k):
+            safe(k, lambda k=k, v=v: o.x("project.project", "write", [project], {k: v}, context=QUIET))
+    log("2. Ruskin: timesheets, portal visibility, e-mail alias ruskin-k1k2@..., documents enabled")
+
+    # 3. Activity types
+    atype = {}
+    for n, days, summ, icon in ACTIVITY_TYPES:
+        atype[n] = safe(f"activity type {n}", lambda n=n, days=days, summ=summ, icon=icon: o.upsert(
+            "mail.activity.type", [("name", "=", n)],
+            {"name": n, "delay_count": days, "delay_unit": "days", "delay_from": "current_date",
+             "res_model": "project.task", "summary": summ, "icon": icon}))
+    todo = o.ref("mail.mail_activity_data_todo")
+    log("3. Activity types ready")
+
+    # 4. Activity plans
+    if model_exists("mail.activity.plan"):
+        for plan, steps in ACTIVITY_PLANS.items():
+            def mk(plan=plan, steps=steps):
+                lines = [(5, 0, 0)]
+                for i, (summ, who, days, typ) in enumerate(steps, 1):
+                    line = {"sequence": i, "summary": summ, "activity_type_id": atype.get(typ) or todo,
+                            "delay_count": days, "delay_unit": "days", "delay_from": "after_plan_date",
+                            "responsible_type": "other" if who in users else "on_demand"}
+                    if who in users:
+                        line["responsible_id"] = users[who]
+                    lines.append((0, 0, line))
+                o.upsert("mail.activity.plan", [("name", "=", plan)],
+                         {"name": plan, "res_model": "project.task", "template_ids": lines})
+            safe(f"activity plan {plan}", mk)
+        log(f"4. Activity plans ready: {len(ACTIVITY_PLANS)}")
+    else:
+        log("4. (activity plans not available in this version)")
+
+    # 5. Project template (new jobs start with the full PH1-PH4 process)
+    def make_template():
+        vals = {"name": TEMPLATE_NAME, "label_tasks": "Tasks", "allow_milestones": True,
+                "allow_task_dependencies": True, "allow_timesheets": True, "privacy_visibility": "portal",
+                "task_properties_definition": PROPERTIES, "is_template": True, "use_documents": True,
+                "description": "<p>Standard BCSI job: PH1 Contract &rarr; PH2 Preconstruction &rarr; PH3 Construction "
+                               "&rarr; PH4 Closeout. Created automatically when a Roofing Contract is sold.</p>"}
+        tmpl = o.upsert("project.project", [("name", "=", TEMPLATE_NAME)], vals)
+        for n, _ in TASK_STAGES:
+            st = one("project.task.type", [("name", "=", n), ("project_ids", "in", [project])])
+            if st:
+                o.x("project.task.type", "write", [st], {"project_ids": [(4, tmpl)]})
+        mil = {}
+        for n, _, _ in MILESTONES:
+            mil[n] = o.upsert("project.milestone", [("name", "=", n), ("project_id", "=", tmpl)],
+                              {"name": n, "project_id": tmpl})
+        stage = {n: one("project.task.type", [("name", "=", n), ("project_ids", "in", [tmpl])]) for n, _ in TASK_STAGES}
+        tasks = [t for t in build_tasks() if not t["parent"]]
+        keys = {t["key"] for t in tasks}
+        tid = {}
+        for t in tasks:
+            name = t["name"].replace(" (Field Work K1 & K2)", " (Field Work)")
+            tg = t["tags"] + (["Phase Gate"] if t["name"] in PHASE_GATES else [])
+            tid[t["key"]] = o.upsert("project.task", [("name", "=", name), ("project_id", "=", tmpl)], {
+                "name": name, "project_id": tmpl, "stage_id": stage[t["stage"]], "sequence": t["sequence"],
+                "tag_ids": [(6, 0, [tags[x] for x in tg])],
+                "milestone_id": mil.get(t["milestone"]) if t["milestone"] else False})
+        for t in tasks:
+            deps = [tid[k] for k in t["deps"] if k in keys]
+            if deps:
+                safe("template dependency", lambda t=t, deps=deps: o.x(
+                    "project.task", "write", [tid[t["key"]]], {"depend_on_ids": [(6, 0, deps)]}, context=QUIET))
+        return tmpl, len(tid)
+    res = safe("project template", make_template)
+    tmpl = res[0] if res else False
+    if res:
+        log(f"5. Project template ready: '{TEMPLATE_NAME}' ({res[1]} process tasks)")
+
+    # 6. Automation rules (require the Automation Rules module)
+    if model_exists("base.automation"):
+        task_model = one("ir.model", [("model", "=", "project.task")])
+        fld = {f: one("ir.model.fields", [("model", "=", "project.task"), ("name", "=", f)]) for f in ("state", "tag_ids")}
+        for name, tag, code, trig in AUTOMATIONS:
+            if trig == "state":
+                pre = "[('state', '!=', '1_done')]"
+                dom = f"[('state', '=', '1_done'), ('tag_ids.name', '=', {tag!r})]"
+            else:
+                pre = f"[('tag_ids.name', '!=', {tag!r})]"
+                dom = f"[('tag_ids.name', '=', {tag!r}), ('state', 'not in', ['1_done', '1_canceled'])]"
+
+            def mk(name=name, code=code, trig=trig, pre=pre, dom=dom):
+                vals = {"name": name, "model_id": task_model, "trigger": "on_create_or_write",
+                        "trigger_field_ids": [(6, 0, [fld[trig]])], "filter_pre_domain": pre, "filter_domain": dom,
+                        "active": True}
+                existing = one("base.automation", [("name", "=", name)])
+                if existing:
+                    o.x("base.automation", "write", [existing], o.clean("base.automation", vals))
+                    return
+                vals["action_server_ids"] = [(0, 0, {"name": name, "model_id": task_model, "state": "code",
+                                                     "code": code, "usage": "base_automation"})]
+                o.x("base.automation", "create", o.clean("base.automation", vals))
+            safe(f"automation '{name}'", mk)
+        log(f"6. Automation rules ready: {len(AUTOMATIONS)}")
+    else:
+        log("6. (Automation Rules module not installed - skipped; see notes)")
+
+    # 7. CRM pipeline for bidding (slide 1 BIDDING / slide 3 80% & 90% reports)
+    if model_exists("crm.stage"):
+        crm = {}
+        for i, (n, won) in enumerate(CRM_STAGES, 1):
+            crm[n] = safe(f"crm stage {n}", lambda n=n, won=won, i=i: o.upsert(
+                "crm.stage", [("name", "=", n)], {"name": n, "sequence": i, "is_won": won}))
+        safe("Ruskin opportunity", lambda: o.upsert("crm.lead", [("name", "=", "Ruskin ES K1 & K2 - Roof Replacement (Kinder Wing)")], {
+            "name": "Ruskin ES K1 & K2 - Roof Replacement (Kinder Wing)", "type": "opportunity",
+            "partner_id": partner["customer"], "stage_id": crm["Won - Accepted Proposal"], "probability": 100,
+            "user_id": users.get("alona", o.uid),
+            "description": "Bid Set: SEI Job No. 26006 (3/12/26). Scope: 07 51 05 built-up roofing, 07 60 05 flashing "
+                           "& sheet metal, 07 90 05 sealants. Accepted proposal -> project created."}))
+        safe("demo bid", lambda: o.upsert("crm.lead", [("name", "=", "DEMO BID - Use for live walkthrough")], {
+            "name": "DEMO BID - Use for live walkthrough", "type": "opportunity", "stage_id": crm["80% Report"],
+            "user_id": users.get("alona", o.uid),
+            "description": "Move through 80% / 90% reports, mark Won, create quotation with the "
+                           "'BCSI Roofing Contract' product, confirm -> project is created from the BCSI template."}))
+        log("7. CRM bidding pipeline ready")
+
+    # 8. Sales: contract product that creates a project from the template
+    if model_exists("sale.order") and tmpl:
+        def mk_product():
+            base = {"name": "BCSI Roofing Contract (creates job from template)", "sale_ok": True, "purchase_ok": False,
+                    "list_price": 0.0, "service_tracking": "project_only", "project_template_id": tmpl,
+                    "invoice_policy": "delivery",
+                    "description_sale": "Roof replacement per contract documents. Invoiced by milestone (SOV)."}
+            for variant in ({"type": "service", "service_type": "milestones"},
+                            {"detailed_type": "service", "service_policy": "delivered_milestones"},
+                            {"type": "service"}):
+                try:
+                    return o.upsert("product.template", [("name", "=", base["name"])], {**base, **variant})
+                except Exception:
+                    continue
+            raise RuntimeError("could not create service product")
+        if safe("contract product", mk_product):
+            log("8. Sales product 'BCSI Roofing Contract' -> creates project from template")
+
+    # 9. Purchase: materials from the submittals + draft RFQ for Sikaflex-1A
+    if model_exists("purchase.order"):
+        prod = {}
+        for name, spec, vendor in PRODUCTS:
+            def mk(name=name, spec=spec, vendor=vendor):
+                vals = {"name": name, "purchase_ok": True, "sale_ok": False, "default_code": spec.replace(" ", ""),
+                        "description_purchase": f"Spec {spec}"}
+                if vendor and partner.get(vendor):
+                    vals["seller_ids"] = [(5, 0, 0), (0, 0, {"partner_id": partner[vendor], "delay": 7})]
+                for variant in ({"type": "consu"}, {"detailed_type": "product"}, {}):
+                    try:
+                        return o.upsert("product.template", [("name", "=", name)], {**vals, **variant})
+                    except Exception:
+                        continue
+            prod[name] = safe(f"product {name}", mk)
+
+        def rfq():
+            if not partner.get("sika"):
+                return
+            origin = "Ruskin ES K1 & K2 - SUB-01 Sealants"
+            if one("purchase.order", [("origin", "=", origin)]):
+                return
+            pp = one("product.product", [("product_tmpl_id", "=", prod[PRODUCTS[0][0]])])
+            vals = {"partner_id": partner["sika"], "origin": origin, "project_id": project,
+                    "notes": "Release after SUB-01 approval and Owner color selection (spec 2.01.A). Quantity TBD.",
+                    "order_line": [(0, 0, {"product_id": pp, "product_qty": 1, "name": PRODUCTS[0][0]})]}
+            o.x("purchase.order", "create", o.clean("purchase.order", vals), context=QUIET)
+        safe("draft RFQ", rfq)
+        log("9. Purchase: products + draft RFQ for Sikaflex-1A (linked to Ruskin)")
+
+    # 10. Employees + Planning roles + shifts (master field resource schedule)
+    if model_exists("planning.slot"):
+        roles = {n: safe(f"role {n}", lambda n=n, c=c: o.upsert("planning.role", [("name", "=", n)], {"name": n, "color": c}))
+                 for n, c in PLANNING_ROLES}
+        emp = {}
+        for m in TEAM:
+            if m["key"] not in users:
+                continue
+
+            def mk_emp(m=m):
+                e = one("hr.employee", [("user_id", "=", users[m["key"]])]) or one("hr.employee", [("name", "=", m["name"])])
+                role = roles.get(TEAM_ROLES[m["key"]])
+                vals = {"name": m["name"], "user_id": users[m["key"]], "job_title": m["role"]}
+                if role:
+                    vals.update({"planning_role_ids": [(4, role)], "default_planning_role_id": role})
+                vals = o.clean("hr.employee", vals)
+                if e:
+                    o.x("hr.employee", "write", [e], vals, context=QUIET)
+                    return e
+                return o.x("hr.employee", "create", vals, context=QUIET)
+            emp[m["key"]] = safe(f"employee {m['name']}", mk_emp)
+        for who, start, end, note in SLOTS:
+            if not emp.get(who):
+                continue
+
+            def mk_slot(who=who, start=start, end=end, note=note):
+                res_id = o.x("hr.employee", "read", [emp[who]], ["resource_id"])[0]["resource_id"][0]
+                if one("planning.slot", [("resource_id", "=", res_id), ("start_datetime", "=", start), ("project_id", "=", project)]):
+                    return
+                o.x("planning.slot", "create", o.clean("planning.slot", {
+                    "resource_id": res_id, "role_id": roles.get(TEAM_ROLES[who]), "project_id": project,
+                    "start_datetime": start, "end_datetime": end, "name": note}), context=QUIET)
+            safe(f"shift {who}", mk_slot)
+        log("10. Employees, planning roles and Ruskin shifts ready")
+
+    # 11. Documents: project folder structure (replaces SharePoint)
+    if model_exists("documents.document"):
+        def folders():
+            f = o.x("project.project", "read", [project], ["documents_folder_id"])[0].get("documents_folder_id")
+            if not f:
+                return "no project folder"
+            parent = f[0]
+            folder_model = "documents.folder" if model_exists("documents.folder") else "documents.document"
+            for n in DOC_FOLDERS:
+                if folder_model == "documents.folder":
+                    o.upsert("documents.folder", [("name", "=", n), ("parent_folder_id", "=", parent)],
+                             {"name": n, "parent_folder_id": parent})
+                else:
+                    o.upsert("documents.document", [("name", "=", n), ("folder_id", "=", parent), ("type", "=", "folder")],
+                             {"name": n, "type": "folder", "folder_id": parent})
+            return "Ruskin folder structure ready"
+        r = safe("document folders", folders)
+        if r:
+            log(f"11. Documents: {r}")
+
+    log(f"\nDone. Workflow configured. Project: {o.url}/odoo/project/{project}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="validate data without connecting")
     ap.add_argument("--no-users", action="store_true", help="do not create the BEST team users")
+    ap.add_argument("--workflow", action="store_true",
+                    help="configure templates, automations, activity plans, CRM, Sales, Purchase, Planning, Documents")
     a = ap.parse_args()
     if a.dry_run:
         o = DryRun()
         build(o, create_users=not a.no_users)
+        o.found = True  # pretend records exist for the workflow pass
+        configure_workflow(o)
+        for _, _, code, _ in AUTOMATIONS:
+            compile(code, "automation", "exec")
         tasks = build_tasks()
         keys = {t["key"] for t in tasks}
         for t in tasks:
@@ -1009,7 +1401,11 @@ def main():
     login, key = os.environ.get("ODOO_LOGIN"), os.environ.get("ODOO_API_KEY")
     if not (login and key):
         sys.exit("Set ODOO_LOGIN and ODOO_API_KEY (see README.md)")
-    build(Odoo(url, os.environ.get("ODOO_DB"), login, key), create_users=not a.no_users)
+    o = Odoo(url, os.environ.get("ODOO_DB"), login, key)
+    if a.workflow:
+        configure_workflow(o)
+    else:
+        build(o, create_users=not a.no_users)
 
 
 if __name__ == "__main__":
