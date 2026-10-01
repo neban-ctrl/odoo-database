@@ -102,8 +102,9 @@ CONTACTS = [
 ]
 
 # BEST project team (Weekly Status Report "BEST PROJECT TEAM" + documents).
-# Users are created WITHOUT e-mail addresses and with Odoo-inbox notifications so the
-# demo never e-mails the real people.
+# Odoo requires e-mail logins: they use the reserved, non-deliverable ".example" domain
+# (RFC 2606) and users get Odoo-inbox notifications, so the demo never e-mails real people.
+LOGIN_DOMAIN = "bcsi-demo.example"
 TEAM = [
     {"key": "maria", "name": "Maria Alimagno", "login": "maria.alimagno", "role": "Project Manager",
      "note": "Author of RFI 001. malimagno@bestcontracting.com / 310-328-6969"},
@@ -644,13 +645,28 @@ class Odoo:
                    fields=["res_id"], limit=1)
         return r[0]["res_id"] if r else False
 
+    OPTIONAL = ("task_properties", "task_properties_definition", "planned_date_begin", "milestone_id",
+                "allocated_hours", "stage_id", "recurring_task", "repeat_interval", "repeat_unit", "repeat_type",
+                "repeat_until", "favorite_user_ids", "notification_type", "website", "comment", "progress")
+
     def upsert(self, model, domain, vals, ctx=None):
         ids = self.x(model, "search", domain, limit=1, context={"active_test": False})
         vals = self.clean(model, vals)
-        if ids:
-            self.x(model, "write", ids, vals, context=ctx or QUIET)
-            return ids[0]
-        return self.x(model, "create", vals, context=ctx or QUIET)
+
+        def save(v):
+            if ids:
+                self.x(model, "write", ids, v, context=ctx or QUIET)
+                return ids[0]
+            return self.x(model, "create", v, context=ctx or QUIET)
+        try:
+            return save(vals)
+        except xmlrpc.client.Fault as e:
+            dropped = [k for k in self.OPTIONAL if k in vals]
+            if not dropped:
+                raise
+            print(f"  note: {model} '{vals.get('name', '')[:40]}' saved without {', '.join(dropped)} "
+                  f"({e.faultString.strip().splitlines()[-1][:120]})")
+            return save({k: v for k, v in vals.items() if k not in dropped})
 
 
 class DryRun(Odoo):
@@ -691,9 +707,12 @@ def build(o, create_users=True):
                                "group_project_stages", "group_project_recurring_tasks")
              if o.has("res.config.settings", k)}
     if feats:
-        sid = o.x("res.config.settings", "create", feats)
-        o.x("res.config.settings", "execute", [sid])
-        log(f"Enabled Project settings: {', '.join(feats)}")
+        try:
+            sid = o.x("res.config.settings", "create", feats)
+            o.x("res.config.settings", "execute", [sid])
+            log(f"Enabled Project settings: {', '.join(feats)}")
+        except Exception as e:
+            log(f"  settings not changed: {str(e).strip().splitlines()[-1][:120]}")
 
     # 2. Contacts
     us = o.x("res.country", "search", [("code", "=", "US")], limit=1)
@@ -721,8 +740,17 @@ def build(o, create_users=True):
             continue
         if not create_users:
             continue
-        vals = {"name": m["name"], "login": m["login"], "function": m["role"], "notification_type": "inbox"}
-        uid = o.x("res.users", "create", o.clean("res.users", vals), context=QUIET)
+        login = f"{m['login']}@{LOGIN_DOMAIN}"
+        found = o.x("res.users", "search", [("login", "=", login)], limit=1, context={"active_test": False})
+        if found:
+            users[m["key"]] = found[0]
+            continue
+        vals = {"name": m["name"], "login": login, "function": m["role"], "notification_type": "inbox"}
+        try:
+            uid = o.x("res.users", "create", o.clean("res.users", vals), context=QUIET)
+        except Exception as e:
+            log(f"  could not create user {m['name']} ({str(e)[:120]}) - tasks will be left unassigned for them")
+            continue
         if grp_user:
             try:
                 gfield = "group_ids" if o.has("res.users", "group_ids") and not isinstance(o, DryRun) else "groups_id"
@@ -830,7 +858,10 @@ def build(o, create_users=True):
             vals["depend_on_ids"] = [(6, 0, [tid[k] for k in t["deps"]])]
         vals = o.clean("project.task", vals)
         if vals:
-            o.x("project.task", "write", [tid[t["key"]]], vals, context=QUIET)
+            try:
+                o.x("project.task", "write", [tid[t["key"]]], vals, context=QUIET)
+            except Exception as e:
+                log(f"  links not saved on {t['name'][:50]}: {str(e).strip().splitlines()[-1][:120]}")
     # states last (dependencies can force "waiting")
     if o.has("project.task", "state"):
         for t in tasks:
@@ -839,6 +870,12 @@ def build(o, create_users=True):
             except Exception as e:  # blocked tasks can refuse "in progress"
                 log(f"  state {t['state']} not applied on {t['name'][:50]}: {str(e)[:80]}")
     log(f"Tasks ready: {len(tid)}")
+
+    def safe(label, fn):
+        try:
+            fn()
+        except Exception as e:
+            log(f"  skipped {label}: {str(e).strip().splitlines()[-1][:150]}")
 
     # 10. Recurring weekly status report task
     rec = {
@@ -875,7 +912,7 @@ def build(o, create_users=True):
         "user_id": users.get("maria", o.uid),
         "description": weekly_report_html(tasks),
     }
-    o.upsert("project.update", [("name", "=", upd["name"]), ("project_id", "=", project)], upd)
+    safe("project update", lambda: o.upsert("project.update", [("name", "=", upd["name"]), ("project_id", "=", project)], upd))
     log("Project update (Weekly Status Report) ready")
 
     # 12. Activities (follow-ups) on key items
@@ -893,9 +930,9 @@ def build(o, create_users=True):
             exists = o.x("mail.activity", "search", [("res_model", "=", "project.task"), ("res_id", "=", tid[key]),
                                                      ("summary", "=", summary)], limit=1)
             if not exists:
-                o.x("mail.activity", "create", {"res_model_id": task_model[0], "res_id": tid[key],
+                safe("activity", lambda key=key, summary=summary, who=who, due=due: o.x("mail.activity", "create", {"res_model_id": task_model[0], "res_id": tid[key],
                                                 "activity_type_id": todo, "summary": summary,
-                                                "user_id": users[who], "date_deadline": due}, context=QUIET)
+                                                "user_id": users[who], "date_deadline": due}, context=QUIET))
 
     # 13. Attach source documents
     def attach(res_model, res_id, fname):
@@ -911,19 +948,21 @@ def build(o, create_users=True):
 
     for t in tasks:
         for f in t["attach"]:
-            attach("project.task", tid[t["key"]], f)
+            safe("attachment", lambda t=t, f=f: attach("project.task", tid[t["key"]], f))
     for f in ("PROCESS_FLOW.pptx", "WR_23009_01_Weekly_Status_Report.xlsm"):
-        attach("project.project", project, f)
+        safe("attachment", lambda f=f: attach("project.project", project, f))
 
     # chatter note on the RFI (logged note, no e-mail)
-    note = o.ref("mail.mt_note")
-    already = o.x("mail.message", "search", [("model", "=", "project.task"), ("res_id", "=", tid["rfi001"]),
-                                             ("body", "ilike", "RFI 001 answered")], limit=1)
-    if not already:
-        o.x("project.task", "message_post", [tid["rfi001"]],
-            body="RFI 001 answered by Steelhead Engineers: disregard header of par. 1.01 - provide 4-ply built-up "
-                 "membrane + cap sheet per par. 3.06.B and detail 1/A10.40. PCO-01 opened to evaluate cost impact.",
-            message_type="comment", subtype_id=note)
+    def rfi_note():
+        note = o.ref("mail.mt_note")
+        already = o.x("mail.message", "search", [("model", "=", "project.task"), ("res_id", "=", tid["rfi001"]),
+                                                 ("body", "ilike", "RFI 001 answered")], limit=1)
+        if not already:
+            o.x("project.task", "message_post", [tid["rfi001"]],
+                body="RFI 001 answered by Steelhead Engineers: disregard header of par. 1.01 - provide 4-ply built-up "
+                     "membrane + cap sheet per par. 3.06.B and detail 1/A10.40. PCO-01 opened to evaluate cost impact.",
+                message_type="comment", subtype_id=note)
+    safe("RFI chatter note", rfi_note)
 
     log(f"\nDone. Open: {o.url}/odoo/project/{project}  (or /web#model=project.project&id={project})")
     return project

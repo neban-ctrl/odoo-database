@@ -23,5 +23,5 @@ python3 build_ruskin_project.py             # build (safe to re-run; updates in 
 Put the four source files in `./source_docs/` (git-ignored) with the names used in the script to have them attached.
 
 Notes
-* Creates 8 internal users for the BEST team (use `--no-users` to skip). Users get **no e-mail address** and Odoo-inbox notifications, so nobody named in the documents is e-mailed.
+* Creates 8 internal users for the BEST team (use `--no-users` to skip). Logins use the reserved non-deliverable domain `@bcsi-demo.example` and Odoo-inbox notifications, so nobody named in the documents is e-mailed.
 * Schedule dates beyond the document dates (RFI 6/2/26, SEI response 6/10/26, transmittal 6/15/26) are illustrative for the demo Gantt.
