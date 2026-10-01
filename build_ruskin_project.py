@@ -35,6 +35,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 import urllib.request
 import xmlrpc.client
 from pathlib import Path
@@ -625,8 +626,26 @@ class Odoo:
             pass
         return self.url.split("//")[1].split(".")[0]
 
+    MIN_INTERVAL = 0.35  # seconds between calls - Odoo Online rate-limits XML-RPC
+
     def x(self, model, method, *args, **kw):
-        return self.models.execute_kw(self.db, self.uid, self.key, model, method, list(args), kw)
+        delay = 10
+        for attempt in range(8):
+            wait = self.MIN_INTERVAL - (time.monotonic() - getattr(self, "_last", 0))
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                return self.models.execute_kw(self.db, self.uid, self.key, model, method, list(args), kw)
+            except xmlrpc.client.ProtocolError as e:
+                if e.errcode not in (429, 502, 503, 504) or attempt == 7:
+                    raise
+                retry_after = (e.headers or {}).get("Retry-After") if hasattr(e, "headers") else None
+                pause = int(retry_after) if retry_after and str(retry_after).isdigit() else delay
+                print(f"  Odoo asked to slow down ({e.errcode}) - waiting {pause}s and retrying...")
+                time.sleep(pause)
+                delay = min(delay * 2, 120)
+            finally:
+                self._last = time.monotonic()
 
     def fields(self, model):
         if model not in self._fields:
